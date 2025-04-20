@@ -19,12 +19,9 @@
 //  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 
-import Accelerate
 import AVFoundation
-import CoreAudio
 import Foundation
 import os.log
-import UIKit
 
 // MARK: - BackendAudioPlayerNotifiable
 
@@ -513,11 +510,12 @@ class BackendAudioPlayer: NSObject {
     } else {
       item = AVPlayerItem(url: url)
     }
-
+      
     if let audioTrack = item?.asset.tracks(withMediaType: .audio).first {
-      let db = AudioMixer
-        .calculateAverageVolume(from: audioTrack) ?? 0 // TODO: don't use this for large audio files and streams
-      let processor = ReplayGainNode(measuredDb: db)
+      //let db = AudioMixer
+      //  .calculateAverageVolume(from: audioTrack) ?? 0 // TODO: don't use this for large audio files and streams
+      let db: Float = 0.0 // TODO: Adjust this value based on the replay gain from the server
+      let processor = VolumenProcessing(measuredDb: db)
       let chain = AudioProcessingChain(nodes: [processor])
       item?.audioMix = AudioMixer.createAudioMix(track: audioTrack, audioProcessingChain: chain)
     }
@@ -560,197 +558,5 @@ class BackendAudioPlayer: NSObject {
         player.removeAllItems()
       }
     }
-  }
-}
-
-// MARK: - AudioProcessingNode
-
-public protocol AudioProcessingNode: AnyObject {
-  func process(timeRange: CMTimeRange, bufferListInOut: UnsafeMutablePointer<AudioBufferList>)
-}
-
-// MARK: - ReplayGainNode
-
-public class ReplayGainNode: NSObject, AudioProcessingNode {
-  private var volume: Float
-
-  init(measuredDb: Float) {
-    let targetDb: Float = -16.0
-    let gainDb = targetDb - measuredDb
-    self.volume = pow(10.0, gainDb / 20.0)
-  }
-
-  public func process(
-    timeRange: CMTimeRange,
-    bufferListInOut: UnsafeMutablePointer<AudioBufferList>
-  ) {
-    let bufferList = UnsafeMutableAudioBufferListPointer(bufferListInOut)
-    for bufferIndex in 0 ..< bufferList.count {
-      let audioBuffer = bufferList[bufferIndex]
-      if let rawBuffer = audioBuffer.mData {
-        let floatRawPointer = rawBuffer.assumingMemoryBound(to: Float.self)
-        let frameCount = UInt(audioBuffer.mDataByteSize) / UInt(MemoryLayout<Float>.size)
-        vDSP_vsmul(floatRawPointer, 1, &volume, floatRawPointer, 1, frameCount)
-      }
-    }
-  }
-}
-
-// MARK: - AudioProcessingChain
-
-public class AudioProcessingChain: NSObject {
-  public let nodes: [AudioProcessingNode]
-
-  init(nodes: [any AudioProcessingNode] = []) {
-    self.nodes = nodes
-  }
-
-  public func process(
-    timeRange: CMTimeRange,
-    bufferListInOut: UnsafeMutablePointer<AudioBufferList>
-  ) {
-    nodes.forEach { node in
-      node.process(timeRange: timeRange, bufferListInOut: bufferListInOut)
-    }
-  }
-}
-
-// MARK: - AudioMixer
-
-// Replay gain
-public class AudioMixer: NSObject {
-  static func calculateAverageVolume(from track: AVAssetTrack) -> Float? {
-    do {
-      let asset = track.asset!
-      let reader = try AVAssetReader(asset: asset)
-
-      let outputSettings: [String: Any] = [
-        AVFormatIDKey: kAudioFormatLinearPCM,
-        AVLinearPCMIsFloatKey: true,
-        AVLinearPCMBitDepthKey: 32,
-        AVLinearPCMIsNonInterleaved: false,
-      ]
-
-      let output = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
-      reader.add(output)
-      reader.startReading()
-
-      var totalSquared: Float = 0
-      var sampleCount: UInt64 = 0
-
-      while let sampleBuffer = output.copyNextSampleBuffer(),
-            let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) {
-        var length = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-
-        CMBlockBufferGetDataPointer(
-          blockBuffer,
-          atOffset: 0,
-          lengthAtOffsetOut: nil,
-          totalLengthOut: &length,
-          dataPointerOut: &dataPointer
-        )
-
-        if let dataPointer {
-          let samples = dataPointer.withMemoryRebound(
-            to: Float.self,
-            capacity: length / MemoryLayout<Float>.size
-          ) {
-            Array(UnsafeBufferPointer(start: $0, count: length / MemoryLayout<Float>.size))
-          }
-          for sample in samples {
-            totalSquared += sample * sample
-          }
-          sampleCount += UInt64(samples.count)
-        }
-        CMSampleBufferInvalidate(sampleBuffer)
-      }
-
-      guard sampleCount > 0 else { return nil }
-
-      let rms = sqrt(totalSquared / Float(sampleCount))
-      let db = 20 * log10(rms)
-      return db // Loudness in dBFS (typically between -80 and 0)
-    } catch {
-      print("Error reading audio: \(error)")
-      return nil
-    }
-  }
-
-  static func createAudioMix(
-    track audioTrack: AVAssetTrack,
-    audioProcessingChain: AudioProcessingChain
-  )
-    -> AVMutableAudioMix? {
-    let audioMix = AVMutableAudioMix()
-    let params = AVMutableAudioMixInputParameters(track: audioTrack)
-
-    var callbacks = MTAudioProcessingTapCallbacks(
-      version: kMTAudioProcessingTapCallbacksVersion_0,
-      clientInfo: UnsafeMutableRawPointer(Unmanaged.passRetained(audioProcessingChain).toOpaque()),
-      init: tapInit,
-      finalize: tapFinalize,
-      prepare: tapPrepare,
-      unprepare: tapUnprepare,
-      process: tapProcess
-    )
-    var tap: Unmanaged<MTAudioProcessingTap>?
-    let err = MTAudioProcessingTapCreate(
-      kCFAllocatorDefault,
-      &callbacks,
-      kMTAudioProcessingTapCreationFlag_PostEffects,
-      &tap
-    )
-    guard err == noErr else {
-      print("error: failed to create audioProcessingTap")
-      return nil
-    }
-
-    params.audioTapProcessor = tap?.takeRetainedValue()
-    audioMix.inputParameters = [params]
-    return audioMix
-  }
-
-  // MARK: - Handler
-
-  static let tapInit: MTAudioProcessingTapInitCallback = {
-    tap, clientInfo, tapStorageOut in
-    tapStorageOut.pointee = clientInfo
-  }
-
-  static let tapFinalize: MTAudioProcessingTapFinalizeCallback = {
-    tap in
-    let storage = MTAudioProcessingTapGetStorage(tap)
-    let unmangedStorage = Unmanaged<AudioProcessingChain>.fromOpaque(storage)
-    unmangedStorage.release()
-  }
-
-  static let tapPrepare: MTAudioProcessingTapPrepareCallback = {
-    tap, maxFrames, processingFormat in
-  }
-
-  static let tapUnprepare: MTAudioProcessingTapUnprepareCallback = {
-    tap in
-  }
-
-  static let tapProcess: MTAudioProcessingTapProcessCallback = {
-    tap, numberFrames, flags, bufferListInOut, numberFramesOut, flagsOut in
-    var timeRange = CMTimeRange.zero
-    let status = MTAudioProcessingTapGetSourceAudio(
-      tap,
-      numberFrames,
-      bufferListInOut,
-      flagsOut,
-      &timeRange,
-      numberFramesOut
-    )
-    if status != noErr {
-      print("error: failed to get source audio")
-      return
-    }
-    let storage = MTAudioProcessingTapGetStorage(tap)
-    let unmangedStorage = Unmanaged<AudioProcessingChain>.fromOpaque(storage)
-    let audioProcessingChain = unmangedStorage.takeUnretainedValue()
-    audioProcessingChain.process(timeRange: timeRange, bufferListInOut: bufferListInOut)
   }
 }
