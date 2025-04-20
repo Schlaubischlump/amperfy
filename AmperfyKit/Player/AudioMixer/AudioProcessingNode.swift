@@ -10,9 +10,13 @@ import AVFoundation
 import CoreAudio
 import CoreMedia
 
+// MARK: - AudioProcessingNode
+
 public protocol AudioProcessingNode: AnyObject {
   func process(timeRange: CMTimeRange, bufferListInOut: UnsafeMutablePointer<AudioBufferList>)
 }
+
+// MARK: - VolumenProcessing
 
 // Update volume of audio track in realtime
 public class VolumenProcessing: NSObject, AudioProcessingNode {

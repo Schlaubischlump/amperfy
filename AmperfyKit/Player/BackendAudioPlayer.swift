@@ -510,10 +510,8 @@ class BackendAudioPlayer: NSObject {
     } else {
       item = AVPlayerItem(url: url)
     }
-      
+
     if let audioTrack = item?.asset.tracks(withMediaType: .audio).first {
-      //let db = AudioMixer
-      //  .calculateAverageVolume(from: audioTrack) ?? 0 // TODO: don't use this for large audio files and streams
       let db: Float = 0.0 // TODO: Adjust this value based on the replay gain from the server
       let processor = VolumenProcessing(measuredDb: db)
       let chain = AudioProcessingChain(nodes: [processor])

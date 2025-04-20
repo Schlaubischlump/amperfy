@@ -79,5 +79,3 @@ public class AudioMixer: NSObject {
     audioProcessingChain.process(timeRange: timeRange, bufferListInOut: bufferListInOut)
   }
 }
-
-
